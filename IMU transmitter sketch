@@ -1,75 +1,276 @@
 #include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <SPI.h>
+#include <nRF24L01.h>
 #include <RF24.h>
 
-// ---- NRF24 ----
-RF24 radio(9, 10);                     // CE, CSN
-const byte address[6] = "00001";
+// ---- Display ----
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// ---- MPU6050 ----
-#define MPU6050_ADDR  0x68
-#define GYRO_XOUT_H   0x43
+// ---- nRF24L01 Setup ----
+#define CE_PIN   7  // You can change these to available pins
+#define CSN_PIN  8
+RF24 radio(CE_PIN, CSN_PIN);
+const byte address[6] = "00001"; // Must match the transmitter address
 
-#define DEADZONE      10.0f            // °/s threshold
-#define SEND_INTERVAL 80              // ms between transmissions
+// ---- Road layout ----
+#define ROAD_X      20
+#define ROAD_WIDTH  88
+#define LANE_COUNT   3
+#define LANE_WIDTH  (ROAD_WIDTH / LANE_COUNT)
 
-float    gyroScale    = 131.0f;
-long     gyroZ_offset = 0;
-unsigned long lastSend = 0;
+// ---- Player ----
+#define PLAYER_W     8
+#define PLAYER_H    12
+#define PLAYER_Y   (SCREEN_HEIGHT - PLAYER_H - 4)
 
-void calibrateGyro() {
-  long sumZ = 0;
-  for (int i = 0; i < 200; i++) {
-    Wire.beginTransmission(MPU6050_ADDR);
-    Wire.write(GYRO_XOUT_H);
-    Wire.endTransmission(false);
-    Wire.requestFrom(MPU6050_ADDR, 6, true);
-    Wire.read(); Wire.read();           // skip X
-    Wire.read(); Wire.read();           // skip Y
-    sumZ += (int16_t)((Wire.read() << 8) | Wire.read());
-    delay(5);
+// ---- Enemies ----
+#define ENEMY_W      8
+#define ENEMY_H     10
+#define MAX_ENEMIES  4
+
+// ---- Game states ----
+#define STATE_TITLE    0
+#define STATE_PLAYING  1
+#define STATE_GAMEOVER 2
+
+// ---- Game variables ----
+int playerLane = 1;
+int gameState = STATE_TITLE;
+int score = 0;
+int highScore = 0;
+
+float enemySpeed    = 12.0;
+int   spawnInterval = 900;
+int   scrollSpeed   = 2;
+int   roadScroll    = 0;
+
+unsigned long lastSpawn      = 0;
+unsigned long lastDifficulty = 0;
+unsigned long gameStartTime  = 0;
+unsigned long gameEndTime    = 0;
+unsigned long lastFrame      = 0;
+unsigned long blinkTimer     = 0;
+bool blinkOn = true;
+
+struct Enemy {
+  int lane;
+  float y;
+  float speed;
+  bool active;
+};
+
+Enemy enemies[MAX_ENEMIES];
+
+// --- Helper Functions ---
+
+int laneToX(int lane, int objWidth) {
+  return ROAD_X + lane * LANE_WIDTH + (LANE_WIDTH - objWidth) / 2;
+}
+
+void drawPlayerCar(int x, int y) {
+  display.drawRect(x, y, PLAYER_W, PLAYER_H, SSD1306_WHITE);
+  display.fillRect(x + 2, y + 1, PLAYER_W - 4, 3, SSD1306_WHITE);
+}
+
+void drawEnemyCar(int x, int y) {
+  display.drawRect(x, y, ENEMY_W, ENEMY_H, SSD1306_WHITE);
+  display.fillRect(x + 2, y + ENEMY_H - 4, ENEMY_W - 4, 3, SSD1306_WHITE);
+}
+
+void drawRoad() {
+  display.drawFastVLine(ROAD_X, 0, SCREEN_HEIGHT, SSD1306_WHITE);
+  display.drawFastVLine(ROAD_X + ROAD_WIDTH, 0, SCREEN_HEIGHT, SSD1306_WHITE);
+  int d1 = ROAD_X + LANE_WIDTH;
+  int d2 = ROAD_X + 2 * LANE_WIDTH;
+  for (int y = -10 + roadScroll; y < SCREEN_HEIGHT; y += 18) {
+    display.drawFastVLine(d1, y, 8, SSD1306_WHITE);
+    display.drawFastVLine(d2, y, 8, SSD1306_WHITE);
   }
-  gyroZ_offset = sumZ / 200;
 }
 
-char readCommand() {
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(GYRO_XOUT_H);
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU6050_ADDR, 6, true);
-  Wire.read(); Wire.read();             // skip X
-  Wire.read(); Wire.read();             // skip Y
-  int16_t rawZ = (Wire.read() << 8) | Wire.read();
-  rawZ -= (int16_t)gyroZ_offset;
-  float gz = rawZ / gyroScale;
-
-  if      (gz >  DEADZONE) return 'R';
-  else if (gz < -DEADZONE) return 'L';
-  else                     return 'C';
+void spawnEnemy() {
+  bool laneBlocked[LANE_COUNT] = {false, false, false};
+  for (int i = 0; i < MAX_ENEMIES; i++) {
+    if (enemies[i].active && enemies[i].y < 15) laneBlocked[enemies[i].lane] = true;
+  }
+  int available[LANE_COUNT];
+  int count = 0;
+  for (int i = 0; i < LANE_COUNT; i++) {
+    if (!laneBlocked[i]) available[count++] = i;
+  }
+  if (count == 0) return;
+  int lane = available[random(count)];
+  for (int i = 0; i < MAX_ENEMIES; i++) {
+    if (!enemies[i].active) {
+      enemies[i].lane   = lane;
+      enemies[i].y      = -ENEMY_H;
+      enemies[i].speed  = enemySpeed + random(0, 2);
+      enemies[i].active = true;
+      return;
+    }
+  }
 }
+
+bool checkCollision() {
+  int px = laneToX(playerLane, PLAYER_W);
+  int py = PLAYER_Y;
+  for (int i = 0; i < MAX_ENEMIES; i++) {
+    if (!enemies[i].active) continue;
+    int ex = laneToX(enemies[i].lane, ENEMY_W);
+    int ey = (int)enemies[i].y;
+    if (px < ex + ENEMY_W && px + PLAYER_W > ex && py < ey + ENEMY_H && py + PLAYER_H > ey) return true;
+  }
+  return false;
+}
+
+void resetGame() {
+  playerLane = 1;
+  score = 0;
+  enemySpeed = 12.0;
+  spawnInterval = 900;
+  scrollSpeed = 2;
+  roadScroll = 0;
+  for (int i = 0; i < MAX_ENEMIES; i++) enemies[i].active = false;
+  lastSpawn = millis();
+  lastDifficulty = millis();
+  gameStartTime = millis();
+}
+
+// --- Screen Draws ---
+
+void drawTitle() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 4);
+  display.println("TRAFFIC WEAVER");
+  if (blinkOn) {
+    display.setCursor(20, 56);
+    display.println("MOVE WHEEL TO START");
+  }
+  display.display();
+}
+
+void drawGame() {
+  display.clearDisplay();
+  drawRoad();
+  for (int i = 0; i < MAX_ENEMIES; i++) {
+    if (enemies[i].active) drawEnemyCar(laneToX(enemies[i].lane, ENEMY_W), (int)enemies[i].y);
+  }
+  drawPlayerCar(laneToX(playerLane, PLAYER_W), PLAYER_Y);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("S:"); display.print(score);
+  display.display();
+}
+
+void drawGameOver() {
+  display.clearDisplay();
+  display.setCursor(28, 2);
+  display.println("GAME OVER");
+  display.setCursor(10, 18);
+  display.print("SCORE: "); display.println(score);
+  if (blinkOn) {
+    display.setCursor(10, 56);
+    display.println("WHEEL TO RESTART");
+  }
+  display.display();
+}
+
+void updateGame() {
+  unsigned long now = millis();
+  roadScroll = (roadScroll + scrollSpeed) % 18;
+  for (int i = 0; i < MAX_ENEMIES; i++) {
+    if (!enemies[i].active) continue;
+    enemies[i].y += enemies[i].speed * 0.18f;
+    if (enemies[i].y > SCREEN_HEIGHT) {
+      enemies[i].active = false;
+      score += 10;
+    }
+  }
+  if (now - lastSpawn >= (unsigned long)spawnInterval) {
+    lastSpawn = now;
+    spawnEnemy();
+  }
+  if (now - lastDifficulty >= 3500) {
+    lastDifficulty = now;
+    if (enemySpeed < 24.0) enemySpeed += 1.5;
+    if (spawnInterval > 300) spawnInterval -= 50;
+  }
+  if (checkCollision()) {
+    if (score > highScore) highScore = score;
+    gameEndTime = millis();
+    gameState = STATE_GAMEOVER;
+  }
+}
+
+// --- Arduino Setup ---
 
 void setup() {
-  Wire.begin();
+  Serial.begin(9600);
 
-  // Wake MPU6050
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x6B); Wire.write(0);
-  Wire.endTransmission();
-  delay(100);
+  // Initialize nRF24
+  if (!radio.begin()) {
+    Serial.println("Radio hardware not responding!");
+    while (1); 
+  }
+  radio.openReadingPipe(0, address);
+  radio.setPALevel(RF24_PA_MIN);
+  radio.startListening();
 
-  calibrateGyro();
-
-  radio.begin();
-  radio.openWritingPipe(address);
-  radio.setPALevel(RF24_PA_LOW);       // increase to RF24_PA_HIGH if range is poor
-  radio.stopListening();
+  randomSeed(analogRead(A0));
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    while (true);
+  }
+  display.clearDisplay();
+  display.display();
 }
+
+// --- Main Loop ---
 
 void loop() {
   unsigned long now = millis();
-  if (now - lastSend < SEND_INTERVAL) return;
-  lastSend = now;
+  if (now - lastFrame < 33) return;
+  lastFrame = now;
 
-  char cmd = readCommand();
-  radio.write(&cmd, sizeof(cmd));
+  if (now - blinkTimer > 450) {
+    blinkTimer = now;
+    blinkOn = !blinkOn;
+  }
+
+  char receivedChar = ' ';
+  if (radio.available()) {
+    radio.read(&receivedChar, sizeof(receivedChar));
+    Serial.print("Received: "); Serial.println(receivedChar);
+  }
+
+  if (gameState == STATE_TITLE) {
+    if (receivedChar != ' ') { // Any movement starts game
+      resetGame();
+      gameState = STATE_PLAYING;
+    }
+    drawTitle();
+  } 
+  else if (gameState == STATE_PLAYING) {
+    // Mapping L, C, R to specific lanes
+    if (receivedChar == 'L') playerLane = 0;
+    else if (receivedChar == 'C') playerLane = 1;
+    else if (receivedChar == 'R') playerLane = 2;
+
+    updateGame();
+    drawGame();
+  } 
+  else if (gameState == STATE_GAMEOVER) {
+    if (receivedChar != ' ') {
+      resetGame();
+      gameState = STATE_PLAYING;
+    }
+    drawGameOver();
+  }
 }
