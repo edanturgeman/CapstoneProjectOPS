@@ -15,13 +15,16 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 RF24 radio(9, 10);   // CE, CSN
 const byte address[6] = "CTRL1";
 
-struct ControlPacket {
-  char command;              // 'L', 'C', or 'R'
+struct __attribute__((packed)) ControlPacket {
+  char command;      // 'L', 'C', or 'R'
   float angle;
   unsigned long counter;
 };
 
-ControlPacket latestPacket = {'C', 0.0, 0};
+ControlPacket latestPacket = {'C', 0.0f, 0};
+
+// pending turn event from radio
+char pendingTurn = 'C';
 
 // ---- Keep only START button physical ----
 #define BTN_START 4
@@ -53,7 +56,7 @@ int gameState = STATE_TITLE;
 int score = 0;
 int highScore = 0;
 
-float enemySpeed    = 12.0;
+float enemySpeed    = 12.0f;
 int   spawnInterval = 900;
 int   scrollSpeed   = 2;
 int   roadScroll    = 0;
@@ -161,12 +164,13 @@ bool checkCollision() {
 }
 
 void resetGame() {
-  playerLane    = 1;   // always start in center lane
+  playerLane    = 1;
   score         = 0;
-  enemySpeed    = 12.0;
+  enemySpeed    = 12.0f;
   spawnInterval = 900;
   scrollSpeed   = 2;
   roadScroll    = 0;
+  pendingTurn   = 'C';
 
   for (int i = 0; i < MAX_ENEMIES; i++) {
     enemies[i].active = false;
@@ -190,7 +194,7 @@ void drawTitle() {
   display.drawFastVLine(56, 20, 30, SSD1306_WHITE);
   display.drawFastVLine(72, 20, 30, SSD1306_WHITE);
 
-  display.fillRect(59, 22, 6, 8, SSD1306_WHITE); // center lane indicator
+  display.fillRect(59, 22, 6, 8, SSD1306_WHITE);
 
   display.setCursor(0, 44);
   display.print("RX:");
@@ -239,6 +243,10 @@ void drawGame() {
   display.print("L:");
   display.print(playerLane);
 
+  display.setCursor(0, 40);
+  display.print("P:");
+  display.print(pendingTurn);
+
   display.display();
 }
 
@@ -272,8 +280,29 @@ void drawGameOver() {
   display.display();
 }
 
+void applyPendingTurn() {
+  if (pendingTurn == 'L') {
+    if (playerLane > 0) {
+      playerLane--;
+      Serial.print("APPLIED TURN: L  new lane=");
+      Serial.println(playerLane);
+    }
+    pendingTurn = 'C';
+  }
+  else if (pendingTurn == 'R') {
+    if (playerLane < LANE_COUNT - 1) {
+      playerLane++;
+      Serial.print("APPLIED TURN: R  new lane=");
+      Serial.println(playerLane);
+    }
+    pendingTurn = 'C';
+  }
+}
+
 void updateGame() {
   unsigned long now = millis();
+
+  applyPendingTurn();
 
   roadScroll = (roadScroll + scrollSpeed) % 18;
 
@@ -296,7 +325,7 @@ void updateGame() {
   if (now - lastDifficulty >= 3500) {
     lastDifficulty = now;
 
-    if (enemySpeed < 24.0) enemySpeed += 1.5;
+    if (enemySpeed < 24.0f) enemySpeed += 1.5f;
     if (scrollSpeed < 5) scrollSpeed++;
     if (spawnInterval > 300) spawnInterval -= 50;
   }
@@ -341,18 +370,25 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // Handle EVERY packet immediately so L/R events do not get overwritten by C
   while (radio.available()) {
     radio.read(&latestPacket, sizeof(latestPacket));
 
-    if (gameState == STATE_PLAYING) {
-      if (latestPacket.command == 'L' && playerLane > 0) {
-        playerLane--;
-      }
-      else if (latestPacket.command == 'R' && playerLane < (LANE_COUNT - 1)) {
-        playerLane++;
-      }
-      // 'C' means stay in same lane
+    Serial.print("RX cmd=");
+    Serial.print(latestPacket.command);
+    Serial.print(" angle=");
+    Serial.print(latestPacket.angle, 1);
+    Serial.print(" counter=");
+    Serial.println(latestPacket.counter);
+
+    if (latestPacket.command == 'L' || latestPacket.command == 'R') {
+      pendingTurn = latestPacket.command;
+      Serial.print("QUEUED TURN: ");
+      Serial.println(pendingTurn);
+    }
+    else if (latestPacket.command == 'C') {
+      // FIXED: transmitter confirmed return to center — clear any stale pending turn
+      pendingTurn = 'C';
+      Serial.println("CENTER CONFIRMED — pendingTurn cleared");
     }
   }
 
@@ -365,7 +401,6 @@ void loop() {
   }
 
   bool startPressed = false;
-
   if (digitalRead(BTN_START) == LOW && now - lastStartPress > DEBOUNCE_MS) {
     lastStartPress = now;
     startPressed = true;
