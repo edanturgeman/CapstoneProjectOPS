@@ -26,8 +26,8 @@ ControlPacket latestPacket = {'C', 0.0f, 0};
 // pending turn event from radio
 char pendingTurn = 'C';
 
-// ---- Keep only START button physical ----
-#define BTN_START 4
+// ---- Keep only the START button physical ----
+#define BTN_START 3
 
 // ---- Road layout ----
 #define ROAD_X      20
